@@ -27,7 +27,7 @@ fi
 Failed=0
 Log="$Work/last.txt"
 
-# run CHECKOUT VERB: assets from CHECKOUT's art folder (it finds .assets above); the output goes to $Log
+# run CHECKOUT VERB: assets from CHECKOUT's art folder (it finds assets.txt above); the output goes to $Log
 run() { (cd "$Work/$1/art" 2>/dev/null || cd "$Work/$1"; timeout 300 "$Exe" "$2") > "$Log" 2>&1 < /dev/null; }
 A() { run A "$1"; }
 B() { run B "$1"; }
@@ -42,19 +42,19 @@ fetched() { sed -n 's/^pulled: \([0-9]*\) chunks fetched.*/\1/p' "$Log"; }
 reused() { sed -n 's/^pulled: .*, \([0-9]*\) reused.*/\1/p' "$Log"; }
 for C in A B; do
     mkdir -p "$Work/$C"
-    mkdir -p "$Work/$C/.assets" && printf 'remote %s\nfolder art\nfolder db\nignore *.lock\n' "$Remote" > "$Work/$C/.assets/config"
+    printf 'remote %s\nfolder art\nfolder db\nignore *.lock\n' "$Remote" > "$Work/$C/assets.txt"
 done
 
-# --- .assets: found from below, and its rules ---
-mkdir -p "$Work/none" "$Work/C/.assets"
-check "no .assets: not a repository" '! run none status && grep -q "not an assets repository" "$Log"'
-printf 'remote %s\nfolder ../outside\n' "$Remote" > "$Work/C/.assets/config"
+# --- assets.txt: found from below, and its rules ---
+mkdir -p "$Work/none" "$Work/C"
+check "no assets.txt: not a repository" '! run none status && grep -q "not an assets repository" "$Log"'
+printf 'remote %s\nfolder ../outside\n' "$Remote" > "$Work/C/assets.txt"
 check "folder with .. refused" '! run C status && grep -q "inside the repository" "$Log"'
-printf 'remote %s\nfolder art\nfolder art/sub\n' "$Remote" > "$Work/C/.assets/config"
+printf 'remote %s\nfolder art\nfolder art/sub\n' "$Remote" > "$Work/C/assets.txt"
 check "overlapping folders refused" '! run C status && grep -q "overlap" "$Log"'
-printf 'remote %s\nfolder art\ncolour blue\n' "$Remote" > "$Work/C/.assets/config"
+printf 'remote %s\nfolder art\ncolour blue\n' "$Remote" > "$Work/C/assets.txt"
 check "unknown setting refused" '! run C status && grep -q "unknown setting" "$Log"'
-printf 'folder art\n' > "$Work/C/.assets/config"
+printf 'folder art\n' > "$Work/C/assets.txt"
 check "no remote refused" '! run C status && grep -q "needs a remote" "$Log"'
 
 # --- first push and pull: spaces, non-ASCII, no extension, an empty file, a file of many chunks ---
@@ -72,7 +72,7 @@ check "status after push: in sync" 'A status && grep -q "^5 files the same" "$Lo
 check "pull into an empty checkout" 'B pull && [ "$(tree A)" = "$(tree B)" ]'
 check "version" '"$Exe" version > "$Log" && grep -q "store format" "$Log"'
 check "the store has a format" 'server "grep -qx \"assets 1\" format"'
-check ".assets/.gitignore shows git only the config" '[ "$(cat "$Work/A/.assets/.gitignore")" = "$(printf "*\n!config\n!.gitignore")" ]'
+check ".assets/ hides itself from git" '[ "$(cat "$Work/A/.assets/.gitignore")" = "*" ]'
 check "verify" 'A verify && grep -q "intact" "$Log"'
 
 # --- deltas: a small edit, and an insert that shifts every byte after it, send about one chunk ---
@@ -89,10 +89,10 @@ check "rename sends nothing" 'A push && [ "$(sent)" = 0 ]'
 check "pull of the rename fetches nothing" 'B pull && [ "$(fetched)" = 0 ] && [ ! -e "$Work/B/art/café art" ] && [ "$(tree A)" = "$(tree B)" ]'
 
 # --- a remote entry outside a checkout's folders is left alone ---
-printf 'remote %s\nfolder art\nignore *.lock\n' "$Remote" > "$Work/B/.assets/config"
+printf 'remote %s\nfolder art\nignore *.lock\n' "$Remote" > "$Work/B/assets.txt"
 printf b-only > "$Work/B/art/b.png"
 check "push without the db folder keeps db on the remote" 'B push && server "grep -q db/moved.bin manifest.txt"'
-printf 'remote %s\nfolder art\nfolder db\nignore *.lock\n' "$Remote" > "$Work/B/.assets/config"
+printf 'remote %s\nfolder art\nfolder db\nignore *.lock\n' "$Remote" > "$Work/B/assets.txt"
 A pull > /dev/null
 
 # --- conflicts keep both copies ---
@@ -183,14 +183,14 @@ check "verify: damaged chunk" '! A verify && grep -q "bad chunk" "$Log"'
 server "mv kept-chunk chunks/$Chunk"
 check "verify: repaired" 'A verify'
 
-# --- another remote (a branch whose .assets names its own store): files are new there, never deletions ---
+# --- another remote (a branch whose assets.txt names its own store): files are new there, never deletions ---
 if [ "$Mode" = ssh ]; then Other=$Host:$Scratch/other; else Other=$(cygpath -w "$Work/other"); fi
 A pull > /dev/null
 Before=$(tree A)
-printf 'remote %s\nfolder art\nfolder db\nignore *.lock\n' "$Other" > "$Work/A/.assets/config"
+printf 'remote %s\nfolder art\nfolder db\nignore *.lock\n' "$Other" > "$Work/A/assets.txt"
 check "another remote: status shows only adds" 'A status && grep -q "^push      A " "$Log" && ! grep -qE "^(pull|conflict|restored|kept)" "$Log"'
 check "another remote: push fills it, nothing here changes" 'A push && [ "$(tree A)" = "$Before" ] && A verify'
-printf 'remote %s\nfolder art\nfolder db\nignore *.lock\n' "$Remote" > "$Work/A/.assets/config"
+printf 'remote %s\nfolder art\nfolder db\nignore *.lock\n' "$Remote" > "$Work/A/assets.txt"
 check "back to the first remote: in sync" 'A status && ! grep -qE "^(pull|push|conflict|restored|kept)" "$Log" && [ "$(tree A)" = "$Before" ]'
 
 # --- a store path that would leave the repository is refused before anything is written ---
@@ -213,20 +213,27 @@ server "echo \"assets 1\" > format"
 
 # --- git: a folder git would also keep is warned about, and push asks ---
 G="$Work/G"
-mkdir -p "$G/art" "$G/.assets"
+mkdir -p "$G/art"
 git init -q "$G"
-printf 'remote %s\nfolder art\n' "$Remote" > "$G/.assets/config"
+printf 'remote %s\nfolder art\n' "$Remote" > "$G/assets.txt"
 printf one > "$G/art/a.png"
 check "git: status warns about an unignored folder" '(cd "$G" && "$Exe" status) > "$Log" 2>&1 < /dev/null && grep -q "aren.t ignored by git" "$Log" && grep -q "remote copy" "$Log"'
 check "git: no console answers no" '! (cd "$G" && "$Exe" push) > "$Log" 2>&1 < /dev/null && grep -q "no answer" "$Log"'
 check "git: n stops" '! (cd "$G" && echo n | "$Exe" push) > "$Log" 2>&1 && grep -q "stopped" "$Log"'
 check "git: a adds the folder to .gitignore and pushes" '(cd "$G" && echo a | "$Exe" push) > "$Log" 2>&1 && grep -qx "/art/" "$G/.gitignore" && grep -q "^pushed" "$Log"'
 check "git: then no warning" '(cd "$G" && "$Exe" status) > "$Log" 2>&1 && ! grep -q "remote copy" "$Log"'
-check "git: git sees .assets/config, not the state" 'git -C "$G" status --porcelain -uall > "$Log" && grep -q ".assets/config" "$Log" && ! grep -q "base-" "$Log"'
+check "git: git sees assets.txt, not the state" 'git -C "$G" status --porcelain -uall > "$Log" && grep -q "assets.txt" "$Log" && ! grep -q "\.assets/" "$Log"'
 git -C "$G" add -f art/a.png && git -C "$G" -c user.name=t -c user.email=t@t commit -qm tracked
 check "git: a tracked file is warned about" '(cd "$G" && "$Exe" status) > "$Log" 2>&1 && grep -q "git tracks 1" "$Log"'
 printf two > "$G/art/a.png"
 check "git: y goes on" '(cd "$G" && echo y | "$Exe" push) > "$Log" 2>&1 && grep -q "^pushed" "$Log"'
+
+# --- folder . syncs the whole tree, but never assets.txt, which belongs to the repository ---
+mkdir -p "$Work/W/sub"
+printf 'remote %s\nfolder .\n' "$(cygpath -w "$Work/wholestore")" > "$Work/W/assets.txt"
+printf top > "$Work/W/top.png"
+printf sub > "$Work/W/sub/s.png"
+check "folder .: syncs the tree, not assets.txt" '(cd "$Work/W" && "$Exe" push) > "$Log" 2>&1 < /dev/null && grep -q "^pushed: 2 files" "$Log" && ! grep -q "assets.txt" "$Work/wholestore/manifest.txt"'
 
 # --- remotes that are git's own space are refused ---
 if [ "$Mode" = ssh ]; then
@@ -239,19 +246,19 @@ else
     Bare=$(cygpath -w "$Work/bare.git")
     Inside=$(cygpath -w "$Work/work/assets")
 fi
-mkdir -p "$Work/R/art" "$Work/R/.assets"
-printf 'remote %s\nfolder art\n' "$Bare" > "$Work/R/.assets/config"
+mkdir -p "$Work/R/art"
+printf 'remote %s\nfolder art\n' "$Bare" > "$Work/R/assets.txt"
 check "remote that is a git repository refused" '! run R status && grep -q "git repository itself" "$Log"'
-printf 'remote %s\nfolder art\n' "$Inside" > "$Work/R/.assets/config"
+printf 'remote %s\nfolder art\n' "$Inside" > "$Work/R/assets.txt"
 check "remote inside a git work tree refused" '! run R status && grep -q "inside a git work tree" "$Log"'
 if [ "$Mode" != ssh ]; then
-    printf 'remote %s\nfolder art\n' "$(cygpath -w "$Work/R/store")" > "$Work/R/.assets/config"
+    printf 'remote %s\nfolder art\n' "$(cygpath -w "$Work/R/store")" > "$Work/R/assets.txt"
     check "remote inside the repository refused" '! run R status && grep -q "inside this repository" "$Log"'
 fi
 
 # --- remote origin: <origin's repo>.git/assets, also when origin's URL leaves out .git ---
 O="$Work/O"
-mkdir -p "$O/art" "$O/.assets"
+mkdir -p "$O/art"
 git init -q "$O"
 if [ "$Mode" = ssh ]; then
     ssh $Host "git init -q --bare $Scratch/origin.git"
@@ -262,7 +269,7 @@ else
     git -C "$O" remote add origin "$(cygpath -w "$Work/origin")"
     store() { (cd "$Work/origin.git/assets" && eval "$1"); }
 fi
-printf 'remote origin\nfolder art\n' > "$O/.assets/config"
+printf 'remote origin\nfolder art\n' > "$O/assets.txt"
 printf '/art/\n' > "$O/.gitignore"
 printf origin > "$O/art/o.png"
 check "remote origin: pushes into origin.git/assets" '(cd "$O" && "$Exe" push) > "$Log" 2>&1 < /dev/null && store "grep -q art/o.png manifest.txt"'

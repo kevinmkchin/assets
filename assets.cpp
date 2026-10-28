@@ -5,8 +5,8 @@
 
         assets status|pull|push|verify|version
 
-    It works in the tree of the nearest .assets/config at or above the current folder, the way git finds
-    .git. .assets/config is plain text, one setting per line, and the only part of .assets/ that git sees:
+    It works in the tree of the nearest assets.txt at or above the current folder, the way git finds .git.
+    assets.txt is plain text, one setting per line, and belongs with the repository (commit it, if git):
 
         remote origin                           <git origin's repo>.git/assets, on origin's host or folder
         remote git@example.com:game.git/assets  or HOST:DIR over ssh
@@ -28,10 +28,11 @@
     to manifests/; file lists and chunks that no manifest of the last 30 days needs are deleted (the trash).
     A store entry outside this checkout's folders (or ignored) is left as it is.
 
-    The rest of .assets/ is this checkout's state, which its own .gitignore hides from git: the base, the
-    manifest as of the last sync with a store (one per store: base-<store id>.txt), makes the compare
-    three-way, so a file changed only elsewhere is pulled, not pushed back, and a store this checkout never
-    synced with gets its files as new ones, never as deletions (a branch whose config names its own store).
+    .assets/ next to assets.txt is this checkout's state, which its own .gitignore ("*") hides from git: the
+    base, the manifest as of the last sync with a store (one per store: base-<store id>.txt), makes the
+    compare three-way, so a file changed only elsewhere is pulled, not pushed back, and a store this checkout
+    never synced with gets its files as new ones, never as deletions (a branch whose assets.txt names its
+    own store).
     Nothing has to be resolved to pull or push: a file changed differently here and in the store keeps both,
     the store's at its path and this checkout's renamed to name.conflict-<checkout folder>-<time>.ext.
 
@@ -896,6 +897,7 @@ internal bool32
 InScope(config *Config, char *Path)
 {
     // NOTE: A path (from the repository root) syncs when it's under a folder and no name in it is left out.
+    //       assets.txt itself never does: it travels with the repository, not the store.
     char *Rest = 0;
     for (u32 FolderIndex = 0; !Rest && FolderIndex < Config->FolderCount; ++FolderIndex)
     {
@@ -910,7 +912,7 @@ InScope(config *Config, char *Path)
             Rest = Path + Length + 1;
         }
     }
-    bool32 Result = (Rest != 0);
+    bool32 Result = (Rest != 0) && strcmp(Path, "assets.txt") != 0;
     for (char *Name = Rest; Result && Name && *Name;)
     {
         char Component[MAX_PATH] = {};
@@ -960,7 +962,8 @@ ScanFolders(BCRYPT_ALG_HANDLE Algorithm, char *Root, config *Config, manifest *C
         {
             char Name[4*MAX_PATH] = {};
             WideCharToMultiByte(CP_UTF8, 0, Found.cFileName, -1, Name, sizeof(Name), 0, 0);
-            if (!strcmp(Name, ".") || !strcmp(Name, "..") || IsLeftOut(Config, Name))
+            if (!strcmp(Name, ".") || !strcmp(Name, "..") || IsLeftOut(Config, Name) ||
+                (Folder[0] == 0 && !strcmp(Name, "assets.txt")))
             {
                 continue;
             }
@@ -1043,14 +1046,14 @@ main(void)
     if (!Status && !Pull && !Push && !Verify)
     {
         fprintf(stderr, "usage: assets status|pull|push|verify|version\n"
-                        "  in a folder at or under one with an .assets/config file, of lines:\n"
+                        "  in a folder at or under one with an assets.txt file, of lines:\n"
                         "    remote origin | HOST:DIR | C:\\folder | \\\\server\\share\\folder\n"
                         "    folder art              (one line per folder, inside the repository)\n"
                         "    ignore *.lock           (names to leave out; * and ? are wildcards)\n");
         return 1;
     }
 
-    // SECTION: find the repository: the nearest folder with an .assets/config, at or above the current one
+    // SECTION: find the repository: the nearest folder with an assets.txt, at or above the current one
     char Root[MAX_PATH] = {};
     {
         wchar_t WideCurrent[MAX_PATH] = {};
@@ -1065,11 +1068,11 @@ main(void)
         {
             Root[Length - 1] = 0;
         }
-        // NOTE: Root has no trailing slash, so a drive's root is "C:" and "C:/.assets/config" is its file.
+        // NOTE: Root has no trailing slash, so a drive's root is "C:" and "C:/assets.txt" is its file.
         for (;;)
         {
             char Candidate[MAX_PATH] = {};
-            snprintf(Candidate, sizeof(Candidate), "%s/.assets/config", Root);
+            snprintf(Candidate, sizeof(Candidate), "%s/assets.txt", Root);
             if (Exists(Candidate))
             {
                 break;
@@ -1077,7 +1080,7 @@ main(void)
             char *Slash = strrchr(Root, '/');
             if (!Slash || Slash <= Root + 1)
             {
-                fprintf(stderr, "not an assets repository: no .assets/config here or in any folder above\n");
+                fprintf(stderr, "not an assets repository: no assets.txt here or in any folder above\n");
                 return 1;
             }
             *Slash = 0;
@@ -1090,11 +1093,11 @@ main(void)
     }
     char *Checkout = strrchr(Root, '/') ? strrchr(Root, '/') + 1 : Root;
 
-    // SECTION: read .assets/config: remote, folder and ignore lines
+    // SECTION: read assets.txt: remote, folder and ignore lines
     config *Config = (config *)calloc(1, sizeof(config));
     {
         char ConfigPath[MAX_PATH] = {};
-        snprintf(ConfigPath, sizeof(ConfigPath), "%s/.assets/config", Root);
+        snprintf(ConfigPath, sizeof(ConfigPath), "%s/assets.txt", Root);
         char *Text = ReadText(ConfigPath, 0);
         bool32 Bad = !Text;
         u32 LineNumber = 0;
@@ -1223,20 +1226,21 @@ main(void)
         }
     }
 
-    // SECTION: this checkout's state, next to the config in .assets/ (its .gitignore lets git see only the config)
+    // SECTION: this checkout's state, in .assets/ (its .gitignore of "*" hides all of it from git)
     char StateDir[MAX_PATH] = {};
     char BasePath[MAX_PATH] = {};
     char TempDir[MAX_PATH] = {};
     snprintf(StateDir, sizeof(StateDir), "%s/.assets", Root);
     snprintf(TempDir, sizeof(TempDir), "%s/tmp", StateDir);
+    MakeFolder(StateDir);
     MakeFolder(TempDir);
     {
         char IgnorePath[MAX_PATH] = {};
         snprintf(IgnorePath, sizeof(IgnorePath), "%s/.gitignore", StateDir);
-        if (!Exists(IgnorePath))
+        char *Ignore = ReadText(IgnorePath, 0);
+        if (!Ignore || strcmp(Ignore, "*\n") != 0)
         {
-            char *Ignore = "*\n!config\n!.gitignore\n";
-            WriteWholeFile(IgnorePath, Ignore, (u32)strlen(Ignore));
+            WriteWholeFile(IgnorePath, "*\n", 2);
         }
     }
 
