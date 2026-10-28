@@ -1,7 +1,13 @@
 # assets
 
-assets keeps the large binary files of a git repository (art, audio, databases) in one store on a server
-or network folder, outside of git, and only transfers changed data.
+```
+assets push      # send your changes
+assets pull      # get everyone else's
+```
+
+assets keeps a set of folders in one store on a server or network folder and only transfers changed data.
+It doesn't need git. It's meant for large binary files (art, audio, databases), alongside or instead of
+git, but it can hold anything, including code that only ever grows.
 
 I wrote it to sync the art for my game and some multi-GB Ghidra databases between machines. Git LFS
 uploads the whole file on every change and needs an LFS server.
@@ -15,25 +21,27 @@ assets push      pull, then upload local changes
 assets verify    check every chunk and rebuild every file in the store
 ```
 
-Run from anywhere in the repository. assets looks upward for `.assets/config`, like git does for `.git`.
+Any folder with `.assets/config` is a repository. Run from anywhere inside it: assets looks upward for
+`.assets/config`, like git does for `.git`.
 
 ### Configuration
 
-`.assets/config` is committed with the repository:
+`.assets/config`:
 
 ```
-remote origin
+remote git@nas:stores/game
 folder art
 folder audio
 ignore *.tmp
 ```
 
-`remote origin` stores the assets in the origin's repository at `<repo>.git/assets` (git ignores folders
-it doesn't know about). `remote` also takes `HOST:DIR` for ssh, or a local folder, mapped drive or share
-(`\\nas\backup\game`). GitHub can't host a store. The store is created on the first push.
+`remote` is the store: `HOST:DIR` for ssh, or a local folder, mapped drive or share (`\\nas\backup\game`).
+In a git repository, `remote origin` puts it in the origin's repository at `<repo>.git/assets` (git ignores
+folders it doesn't know about). GitHub can't host a store. The store is created on the first push.
 
-`folder` is a folder to sync, relative to the repository root. `ignore` is a file or folder name to skip
-(`*` and `?` wildcards). The rest of `.assets/` is local state, hidden from git by `.assets/.gitignore`.
+`folder` is a folder to sync, relative to the repository root (`folder .` for all of it). `ignore` is a
+file or folder name to skip (`*` and `?` wildcards). The rest of `.assets/` is local state. If you use
+git, commit `.assets/config`; `.assets/.gitignore` hides the rest.
 
 ### How it works
 
@@ -50,14 +58,18 @@ in two checkouts, pull keeps both: the store's version at the original path and 
 `name.conflict-<checkout>-<time>.ext`. Pull and push never stop for conflicts. They are listed until one
 copy of each pair is deleted.
 
-### Git
+### History and branches
 
-Asset folders should be in `.gitignore`. If git tracks or would add files in them, assets warns and asks
-before pulling or pushing (continue, stop, or add the folders to `.gitignore`).
+A store has one current state and no branches. Every checkout pulls the same files, and the only history
+is the 30 days of old manifests. This works best for files that only grow: a new version gets a new name
+(`rock_v2.png`) instead of replacing one that something else still uses.
 
-The store has no branches. Every checkout pulls the same state. The simplest approach is to only add
-assets: a branch that needs a different texture gets a new file (`rock_v2.png`). A branch can also point
-`remote` at its own store, in a checkout of its own (`git worktree add`).
+### With git
+
+The synced folders should be in `.gitignore`. If git tracks or would add files in them, assets warns and
+asks before pulling or pushing (continue, stop, or add the folders to `.gitignore`). Git branches don't
+switch the synced folders. A branch that needs different assets can point `remote` at its own store, in a
+checkout of its own (`git worktree add`).
 
 ### Compared to Git LFS and git-annex
 

@@ -1,6 +1,7 @@
 /*
-    assets: keeps a repository's asset folders (art, sounds, databases: big files that stay out of git) in
-    one copy on a server, sending only what changed, and never blocking on a conflict. MIT license.
+    assets: keeps a repository's folders (typically big files: art, sounds, databases) in one store on a
+    server or folder, sending only what changed, and never blocking on a conflict. It doesn't need git; next
+    to git it stays out of git's way. MIT license.
 
         assets status|pull|push|verify|version
 
