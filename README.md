@@ -1,105 +1,87 @@
 # assets
 
-**Big files next to git, without the pain.** `assets` keeps your art, sounds, models and databases in one
-copy on your own server or NAS, outside git, and sends only what changed.
+assets keeps the large binary files of a git repository (art, audio, databases) in one store on a server
+or network folder, outside of git, and only transfers changed data.
+
+I wrote it to sync the art for my game and some multi-GB Ghidra databases between machines. Git LFS
+uploads the whole file on every change and needs an LFS server.
+
+### Usage
 
 ```
-assets push      # send your changes
-assets pull      # get everyone else's
+assets status    differences between this checkout and the store
+assets pull      apply the store's changes
+assets push      pull, then upload local changes
+assets verify    check every chunk and rebuild every file in the store
 ```
 
-## Why assets
+Run from anywhere in the repository. assets looks upward for `.assets/config`, like git does for `.git`.
 
-- **It never blocks you.** When a file changed in two places, you get both: theirs at its path, yours
-  beside it as `rock.conflict-<you>-<time>.png`. Pull and push carry on. Resolve collisions when it
-  suits you.
-- **Only changes travel.** Files are split into content-defined chunks, stored once. A re-save of a
-  155 MB database sends 7 MB. Moving or renaming a folder sends nothing.
-- **It stays out of git.** No pointer files, hooks or special server. Git sees one small config file.
-- **Your storage.** Any Linux box you can ssh into, or a plain folder: local, mapped drive or network
-  share. No service, no account.
-- **One small program.** A single `.exe` with no dependencies, built from one C++ file.
-- **Safe.** A push that stops halfway changes nothing, every chunk is checked against its hash, and
-  deleted files stay recoverable for 30 days.
+### Configuration
 
-## Compared to Git LFS and git-annex
-
-| | assets | Git LFS | git-annex |
-|---|---|---|---|
-| Conflicts | **both kept, never blocks** | git merge conflict | both kept as variants |
-| Edit to a 1 GB file sends | **only changed chunks** | whole file | whole file |
-| In git | **one config file** | pointer per asset | symlink per asset |
-| Server | **ssh + bash, or a folder** | LFS server | ssh + git-annex |
-| Asset history per commit | no (30-day trash) | yes | yes |
-| Fetch only some files | no | partly | yes |
-| Platforms | Windows | all | all |
-
-Pick **assets** to keep asset folders in sync with the least ceremony, especially huge files that change
-a little at a time. Pick LFS or git-annex if you need every old version tied to its commit.
-
-## Setup
-
-Build from a Visual Studio x64 developer prompt, then put `build\assets.exe` on your PATH:
-
-```
-build.bat
-```
-
-Add `.assets\config` at your repository's root and commit it:
+`.assets/config` is committed with the repository:
 
 ```
 remote origin
 folder art
-folder sounds
+folder audio
 ignore *.tmp
 ```
 
-| Line | Meaning |
-|---|---|
-| `remote origin` | Store in your git origin's repository, under `/assets` (needs an ssh or folder origin). |
-| `remote HOST:DIR` | Store over ssh, like `git@nas:backups/game`. |
-| `remote C:\folder` | Store in a folder, mapped drive or share (`\\nas\backups\game`). |
-| `folder PATH` | A folder to sync, relative to the repository root. One line each. |
-| `ignore NAME` | File or folder names to skip. `*` and `?` are wildcards. |
+`remote origin` stores the assets in the origin's repository at `<repo>.git/assets` (git ignores folders
+it doesn't know about). `remote` also takes `HOST:DIR` for ssh, or a local folder, mapped drive or share
+(`\\nas\backup\game`). GitHub can't host a store. The store is created on the first push.
 
-The store is created on first push. GitHub and similar hosts can't hold it, so point `remote` at your
-own server or a folder.
+`folder` is a folder to sync, relative to the repository root. `ignore` is a file or folder name to skip
+(`*` and `?` wildcards). The rest of `.assets/` is local state, hidden from git by `.assets/.gitignore`.
 
-## Use
+### How it works
 
-From anywhere in the repository:
+Files are split into content-defined chunks (FastCDC, 16 KB average), each stored once by its SHA-256.
+Re-saving a 155 MB Ghidra database uploads about 7 MB. Moving or renaming files uploads nothing. A pull
+rebuilds files from local chunks plus the missing ones.
 
-```
-assets status    what changed here, in the store, or both
-assets pull      bring the store's changes here
-assets push      pull, then send your changes
-assets verify    check every chunk and rebuild every stored file
-```
+A push stages everything, checks each chunk against its hash, then replaces the manifest. An interrupted
+push leaves the store unchanged. If another push finished first, it is rejected and has to be run again.
+Old manifests are kept for 30 days, so deleted files can be recovered within that time.
 
-Collisions are listed by every command until you keep one copy and delete the other. A file another
-program has locked stops pull and push, rather than looking deleted.
+Each checkout keeps the manifest of its last sync, so changes are compared three ways. If a file changed
+in two checkouts, pull keeps both: the store's version at the original path and the local one renamed to
+`name.conflict-<checkout>-<time>.ext`. Pull and push never stop for conflicts. They are listed until one
+copy of each pair is deleted.
 
-If git also tracks or would add files in an asset folder, `assets` warns you (two remote copies can
-disagree) and asks whether to continue, stop, or add the folder to `.gitignore`.
+### Git
 
-## Branches
+Asset folders should be in `.gitignore`. If git tracks or would add files in them, assets warns and asks
+before pulling or pushing (continue, stop, or add the folders to `.gitignore`).
 
-The store has no branches; every checkout gets its current state. Two ways to work with that:
+The store has no branches. Every checkout pulls the same state. The simplest approach is to only add
+assets: a branch that needs a different texture gets a new file (`rock_v2.png`). A branch can also point
+`remote` at its own store, in a checkout of its own (`git worktree add`).
 
-- **Let assets only grow.** Branch your code, not your art. To change an asset another branch still
-  uses, add a new file (`rock_v2.png`) instead of editing it.
-- **Give a branch its own store.** Its `.assets\config` names another remote, and it gets its own
-  checkout (`git worktree add`), since `git checkout` doesn't swap untracked asset folders. Switching
-  stores never deletes files.
+### Compared to Git LFS and git-annex
 
-## Requirements
+| | assets | Git LFS | git-annex |
+|---|---|---|---|
+| Edit to a 1 GB file uploads | changed chunks | whole file | whole file |
+| Files in git | `.assets/config` | a pointer per file | a symlink per file |
+| Server | ssh with bash, or a folder | LFS server | ssh with git-annex |
+| Conflicts | both copies kept | merge conflict | both copies kept |
+| History per commit | no (30 days) | yes | yes |
+| Platforms | Windows | all | all |
 
-- Windows 10 or later. ssh stores use Windows' built-in OpenSSH.
-- ssh servers need bash, tar and GNU coreutils (any Linux).
-- Paths up to about 190 characters. Timestamps, empty folders and symlinks aren't kept.
+### Building
 
-Tests: `tests\run.sh` (offline) and `tests\run.sh ssh user@host`, in Git Bash.
+Run `build.bat` from a Visual Studio x64 developer prompt. It produces `build\assets.exe`, with no
+dependencies. Tests: `tests\run.sh` (local folder store) and `tests\run.sh ssh user@host` (Git Bash).
 
-## License
+### Limitations
+
+- Windows 10 or later. ssh stores use Windows' OpenSSH client.
+- ssh servers need bash, tar and GNU coreutils.
+- Paths up to about 190 characters. Longer paths are reported.
+- Timestamps, empty folders and symlinks aren't preserved.
+
+### License
 
 MIT
