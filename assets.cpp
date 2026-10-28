@@ -147,7 +147,7 @@ struct change
 // NOTE: Every path a file can take here (a repository path plus ".assets-tmp" or a conflict suffix) fits
 //       in MAX_PATH; longer ones are refused up front, never truncated.
 #define PATH_LIMIT (MAX_PATH - 64)
-#define VERSION "1.0"
+#define VERSION "0.1.0"
 #define STORE_FORMAT "assets 1"
 
 internal int
