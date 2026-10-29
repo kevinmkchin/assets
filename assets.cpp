@@ -3,7 +3,10 @@
     server or folder, sending only what changed, and never blocking on a conflict. It doesn't need git; next
     to git it stays out of git's way. MIT license.
 
-        assets status|pull|push|verify|version
+        assets status|pull|push [PATH...]       paths limit a command to them; the rest stays as it is
+        assets log [PATH...]                    the pushes still in the history, newest first
+        assets restore PATH VERSION             a file's version from the history, as a change here
+        assets verify|version|help
 
     It works in the tree of the nearest assets.txt at or above the current folder, the way git finds .git.
     assets.txt is plain text, one setting per line, and belongs with the repository (commit it, if git):
@@ -25,7 +28,8 @@
     A push stages everything in incoming/ (over ssh: one tar stream, unpacked and checked by the commit.sh
     inside it), checks every chunk against its hash, and replaces the manifest last, so a push that stops
     halfway changes nothing; if another push committed meanwhile it's refused. The replaced manifest moves
-    to manifests/; file lists and chunks that no manifest of the last 30 days needs are deleted (the trash).
+    to manifests/ (named by the time it was replaced: log and restore read them); file lists and chunks that
+    no manifest of the last 30 days needs are deleted (the trash).
     A store entry outside this checkout's folders (or ignored) is left as it is.
 
     .assets/ next to assets.txt is this checkout's state, which its own .gitignore ("*") hides from git: the
@@ -135,6 +139,7 @@ struct change
     file_entry *Server;
     char *OldCopy;  // pull: where this checkout's previous version of the file is now (its chunks get reused)
     bool32 Failed;  // pull didn't manage it: base.txt keeps the old entry, and push refuses
+    bool32 KeepBase; // left alone (outside the paths given, or a restore): base.txt keeps the old entry
 };
 
 // NOTE: Chunk sizes. Changing them (or the gear table in ChunkFile) only costs deduplication against
@@ -175,6 +180,40 @@ SizeText(u64 Bytes)
     else
     {
         snprintf(Result.Text, sizeof(Result.Text), "%.2f GB", (double)Bytes / (1ull << 30));
+    }
+    return Result;
+}
+
+internal char *
+Plural(u64 Count)
+{
+    char *Result = (Count == 1) ? "" : "s";
+    return Result;
+}
+
+struct time_text
+{
+    char Text[32];
+};
+
+// NOTE: A history file's name starts with the UTC time it was replaced, YYYYMMDDTHHMMSS; shown in local time.
+internal time_text
+HistoryTime(char *Name)
+{
+    time_text Result = {};
+    SYSTEMTIME Utc = {};
+    SYSTEMTIME Here = {};
+    bool32 Parsed = strlen(Name) >= 15 && Name[8] == 'T' &&
+                    sscanf(Name, "%4hu%2hu%2huT%2hu%2hu%2hu", &Utc.wYear, &Utc.wMonth, &Utc.wDay, &Utc.wHour,
+                           &Utc.wMinute, &Utc.wSecond) == 6;
+    if (Parsed && SystemTimeToTzSpecificLocalTime(0, &Utc, &Here))
+    {
+        snprintf(Result.Text, sizeof(Result.Text), "%04u-%02u-%02u %02u:%02u:%02u", Here.wYear, Here.wMonth, Here.wDay,
+                 Here.wHour, Here.wMinute, Here.wSecond);
+    }
+    else
+    {
+        snprintf(Result.Text, sizeof(Result.Text), "%.31s", Name);
     }
     return Result;
 }
@@ -953,6 +992,46 @@ InScope(config *Config, char *Path)
     return Result;
 }
 
+internal bool32
+IsSelected(char **Selection, u32 SelectionCount, char *Path)
+{
+    // NOTE: No selection is everything; else Path is a selected path or inside one ("." is the whole repository).
+    bool32 Result = (SelectionCount == 0);
+    for (u32 Index = 0; !Result && Index < SelectionCount; ++Index)
+    {
+        size_t Length = strlen(Selection[Index]);
+        Result = !strcmp(Selection[Index], ".") ||
+                 (!_strnicmp(Path, Selection[Index], Length) && (Path[Length] == '/' || !Path[Length]));
+    }
+    return Result;
+}
+
+internal manifest
+TakeSelected(manifest *Selected, manifest *Rest, char **Selection, u32 SelectionCount)
+{
+    // NOTE: Selected's entries at selected paths, Rest's everywhere else.
+    manifest Result = {};
+    for (u32 Index = 0; Index < Selected->Count; ++Index)
+    {
+        if (IsSelected(Selection, SelectionCount, Selected->Entries[Index].Path))
+        {
+            AddEntry(&Result, Selected->Entries[Index]);
+        }
+    }
+    for (u32 Index = 0; Index < Rest->Count; ++Index)
+    {
+        if (!IsSelected(Selection, SelectionCount, Rest->Entries[Index].Path))
+        {
+            AddEntry(&Result, Rest->Entries[Index]);
+        }
+    }
+    if (Result.Count)
+    {
+        qsort(Result.Entries, Result.Count, sizeof(file_entry), CompareEntries);
+    }
+    return Result;
+}
+
 internal manifest
 ScanFolders(BCRYPT_ALG_HANDLE Algorithm, char *Root, config *Config, manifest *Cache, bool32 *OutFailed)
 {
@@ -1059,44 +1138,60 @@ main(void)
     int ArgCount = 0;
     wchar_t **WideArgs = CommandLineToArgvW(GetCommandLineW(), &ArgCount);
     char Verb[64] = {};
-    if (ArgCount == 2)
+    if (ArgCount >= 2)
     {
         WideCharToMultiByte(CP_UTF8, 0, WideArgs[1], -1, Verb, sizeof(Verb), 0, 0);
+    }
+    // NOTE: The arguments after the command: paths (status, pull, push, log), or restore's PATH VERSION.
+    u32 ExtraCount = (ArgCount > 2) ? (u32)(ArgCount - 2) : 0;
+    char **Extras = (char **)calloc(ExtraCount + 1, sizeof(char *));
+    for (u32 Index = 0; Index < ExtraCount; ++Index)
+    {
+        Extras[Index] = (char *)calloc(4*MAX_PATH, 1);
+        WideCharToMultiByte(CP_UTF8, 0, WideArgs[Index + 2], -1, Extras[Index], 4*MAX_PATH, 0, 0);
     }
     bool32 Status = !strcmp(Verb, "status");
     bool32 Pull = !strcmp(Verb, "pull");
     bool32 Push = !strcmp(Verb, "push");
     bool32 Verify = !strcmp(Verb, "verify");
+    bool32 Log = !strcmp(Verb, "log");
+    bool32 Restore = !strcmp(Verb, "restore");
     if (!strcmp(Verb, "version") || !strcmp(Verb, "--version"))
     {
         printf("assets %s (store format \"%s\")\n", VERSION, STORE_FORMAT);
         return 0;
     }
-    if (!Status && !Pull && !Push && !Verify)
+    bool32 Usable = ((Status || Pull || Push || Log) || (Verify && !ExtraCount) || (Restore && ExtraCount == 2));
+    if (!Usable)
     {
         bool32 Help = !strcmp(Verb, "help") || !strcmp(Verb, "--help") || !strcmp(Verb, "-h") || !strcmp(Verb, "/?");
         fprintf(Help ? stdout : stderr,
                 "usage: assets COMMAND\n"
                 "\n"
-                "  status    list what differs between this checkout and the remote; changes nothing\n"
-                "  pull      bring the remote's changes here\n"
-                "  push      pull, then send this checkout's changes (only chunks the remote lacks)\n"
-                "  verify    check every chunk and file on the remote against its hash\n"
-                "  version   print the version and the store format\n"
-                "  help      print this\n"
+                "  status [PATH...]        list what differs between this checkout and the remote; changes nothing\n"
+                "  pull [PATH...]          bring the remote's changes here\n"
+                "  push [PATH...]          pull, then send this checkout's changes (only chunks the remote lacks)\n"
+                "  log [PATH...]           the pushes of the last %d days, newest first, with each file's version\n"
+                "  restore PATH VERSION    put back a version of a file from log (then push it)\n"
+                "  verify                  check every chunk and file on the remote against its hash\n"
+                "  version                 print the version and the store format\n"
+                "  help                    print this\n"
+                "\n"
+                "PATHs (files or folders, from the current folder) limit a command to them; the rest stays as\n"
+                "it is. status exits with 2 when the remote has changes to pull, 1 on an error.\n"
                 "\n"
                 "Run in the folder with assets.txt or any folder below it. assets.txt, one setting per line:\n"
-                "  remote origin         git's origin remote, plus /assets\n"
-                "  remote HOST:DIR       a folder on an ssh server\n"
-                "  remote D:\\store       a local folder, mapped drive or \\\\server\\share\\folder\n"
-                "  folder art            a folder to sync, inside the repository (one line each)\n"
-                "  ignore *.lock         names to leave out; * and ? are wildcards\n"
-                "  # text                a comment\n"
+                "  remote origin           git's origin remote, plus /assets\n"
+                "  remote HOST:DIR         a folder on an ssh server\n"
+                "  remote D:\\store         a local folder, mapped drive or \\\\server\\share\\folder\n"
+                "  folder art              a folder to sync, inside the repository (one line each)\n"
+                "  ignore *.lock           names to leave out; * and ? are wildcards\n"
+                "  # text                  a comment\n"
                 "\n"
                 "A file changed here and on the remote is kept twice: pull renames yours to\n"
                 "NAME.conflict-CHECKOUT-TIME.EXT. Keep one, delete the other, push.\n"
                 "Replaced and deleted files stay on the remote for %d days.\n",
-                TRASH_DAYS);
+                TRASH_DAYS, TRASH_DAYS);
         return Help ? 0 : 1;
     }
 
@@ -1271,6 +1366,53 @@ main(void)
         {
             return 1;
         }
+    }
+
+    // SECTION: the paths given (from the current folder) as paths from the repository root; "." for all of it
+    // NOTE: restore takes one (its file) and a version; the other commands any number, each in or around a folder.
+    u32 SelectionCount = 0;
+    char **Selection = (char **)calloc(ExtraCount + 1, sizeof(char *));
+    for (u32 Index = 0; Index < (Restore ? 1u : ExtraCount); ++Index)
+    {
+        wchar_t WideArg[MAX_PATH] = {};
+        wchar_t WideFull[MAX_PATH] = {};
+        Widen(Extras[Index], WideArg, MAX_PATH);
+        char Full[4*MAX_PATH] = {};
+        if (GetFullPathNameW(WideArg, MAX_PATH, WideFull, 0))
+        {
+            WideCharToMultiByte(CP_UTF8, 0, WideFull, -1, Full, sizeof(Full), 0, 0);
+        }
+        for (char *C = Full; *C; ++C)
+        {
+            *C = (*C == '\\') ? '/' : *C;
+        }
+        while (strlen(Full) > 1 && Full[strlen(Full) - 1] == '/')
+        {
+            Full[strlen(Full) - 1] = 0;
+        }
+        size_t RootLength = strlen(Root);
+        if (!Full[0] || _strnicmp(Full, Root, RootLength) || (Full[RootLength] != '/' && Full[RootLength]))
+        {
+            fprintf(stderr, "%s: outside this repository (%s)\n", Extras[Index], Root);
+            return 1;
+        }
+        char *Path = Full[RootLength] ? Full + RootLength + 1 : (char *)".";
+        bool32 Synced = !strcmp(Path, ".");
+        for (u32 FolderIndex = 0; !Synced && FolderIndex < Config->FolderCount; ++FolderIndex)
+        {
+            char *Folder = Config->Folders[FolderIndex];
+            size_t FolderLength = strlen(Folder);
+            size_t PathLength = strlen(Path);
+            Synced = !strcmp(Folder, ".") ||
+                     (!_strnicmp(Path, Folder, FolderLength) && (Path[FolderLength] == '/' || !Path[FolderLength])) ||
+                     (!_strnicmp(Folder, Path, PathLength) && Folder[PathLength] == '/');
+        }
+        if (!Synced)
+        {
+            fprintf(stderr, "%s: not in a synced folder (the folder lines of assets.txt)\n", Extras[Index]);
+            return 1;
+        }
+        Selection[SelectionCount++] = _strdup(Path);
     }
 
     // SECTION: this checkout's state, in .assets/ (its .gitignore of "*" hides all of it from git)
@@ -1722,6 +1864,173 @@ main(void)
         return Bad ? 1 : 0;
     }
 
+    // SECTION: the history (log, restore): manifests/<time it was replaced>.txt, oldest first, then the current one
+    // NOTE: Version i was current from Began[i] (the name of version i-1's file; 0: before the history) on.
+    u32 VersionCount = 0;
+    manifest *Versions = 0;
+    char **Began = 0;
+    if (Log || Restore)
+    {
+        u32 HistoryCount = 0;
+        char **Names = 0;
+        char **Texts = 0;
+        if (Local)
+        {
+            char Folder[MAX_PATH] = {};
+            snprintf(Folder, sizeof(Folder), "%s/manifests", Dir);
+            folder_entry *Entries = ListFolder(Folder, &HistoryCount);
+            Names = (char **)calloc(HistoryCount + 1, sizeof(char *));
+            Texts = (char **)calloc(HistoryCount + 1, sizeof(char *));
+            for (u32 Index = 0; Index < HistoryCount; ++Index)
+            {
+                char Path[MAX_PATH] = {};
+                snprintf(Path, sizeof(Path), "%s/%s", Folder, Entries[Index].Name);
+                Names[Index] = Entries[Index].Name;
+                Texts[Index] = ReadText(Path, 0);
+            }
+        }
+        else
+        {
+            // NOTE: Each file comes as "== NAME LINES" and then its lines (a manifest may be empty).
+            char *Reply = 0;
+            snprintf(Script, sizeof(Script),
+                     "export LC_ALL=C\n"
+                     "cd %s/manifests 2>/dev/null || exit 0\n"
+                     "for f in *.txt; do [ -f \"$f\" ] || continue; echo \"== $f $(wc -l < \"$f\")\"; cat \"$f\"; done\n"
+                     "exit 0\n", Dir);
+            if (RunProcess(SshCommand, Script, 0, &Reply, 0, false) != 0)
+            {
+                fprintf(stderr, "%s: can't read the history\n", Remote);
+                return 1;
+            }
+            u32 Max = 0;
+            for (char *At = Reply; *At; ++At)
+            {
+                Max += (*At == '\n') ? 1 : 0;
+            }
+            Names = (char **)calloc(Max + 1, sizeof(char *));
+            Texts = (char **)calloc(Max + 1, sizeof(char *));
+            for (char *At = Reply; At && !strncmp(At, "== ", 3);)
+            {
+                char *End = strchr(At, '\n');
+                if (!End)
+                {
+                    break;
+                }
+                *End = 0;
+                char *Space = strrchr(At, ' ');
+                if (!Space || Space < At + 3)
+                {
+                    break;
+                }
+                *Space = 0;
+                u32 Lines = (u32)strtoul(Space + 1, 0, 10);
+                char *Body = End + 1;
+                char *BodyEnd = Body;
+                for (u32 Line = 0; Line < Lines && BodyEnd && *BodyEnd; ++Line)
+                {
+                    BodyEnd = strchr(BodyEnd, '\n');
+                    BodyEnd = BodyEnd ? BodyEnd + 1 : 0;
+                }
+                Names[HistoryCount] = At + 3;
+                At = BodyEnd;
+                if (BodyEnd)
+                {
+                    // NOTE: The next "== " line starts right after; keep its first character before cutting here.
+                    char First = *BodyEnd;
+                    *BodyEnd = 0;
+                    Texts[HistoryCount++] = _strdup(Body);
+                    *BodyEnd = First;
+                }
+                else
+                {
+                    Texts[HistoryCount++] = _strdup(Body);
+                }
+            }
+        }
+        Versions = (manifest *)calloc(HistoryCount + 1, sizeof(manifest));
+        Began = (char **)calloc(HistoryCount + 1, sizeof(char *));
+        for (u32 Index = 0; Index < HistoryCount; ++Index)
+        {
+            bool32 Ignored = false;
+            Versions[VersionCount] = ParseManifest(Texts[Index] ? Texts[Index] : (char *)"", false, &Ignored);
+            Began[VersionCount] = Index ? Names[Index - 1] : 0;
+            ++VersionCount;
+        }
+        Versions[VersionCount] = ServerAll;
+        Began[VersionCount] = HistoryCount ? Names[HistoryCount - 1] : 0;
+        ++VersionCount;
+    }
+
+    // SECTION: log: each push still in the history, newest first, as the files it added, changed or deleted
+    if (Log)
+    {
+        for (u32 Index = VersionCount - 1; Index >= 1; --Index)
+        {
+            manifest *Old = Versions + Index - 1;
+            manifest *New = Versions + Index;
+            u32 OldIndex = 0;
+            u32 NewIndex = 0;
+            bool32 Shown = false;
+            while (OldIndex < Old->Count || NewIndex < New->Count)
+            {
+                file_entry *A = OldIndex < Old->Count ? Old->Entries + OldIndex : 0;
+                file_entry *B = NewIndex < New->Count ? New->Entries + NewIndex : 0;
+                int Order = !A ? 1 : !B ? -1 : strcmp(A->Path, B->Path);
+                file_entry *Entry = (Order <= 0) ? A : B;
+                char Kind = (Order < 0) ? 'D' : (Order > 0) ? 'A' : strcmp(A->Hash, B->Hash) ? 'M' : 0;
+                if (Order > 0)
+                {
+                    ++NewIndex;
+                }
+                else if (Order < 0)
+                {
+                    ++OldIndex;
+                }
+                else
+                {
+                    Entry = B;
+                    ++OldIndex;
+                    ++NewIndex;
+                }
+                if (Kind && InScope(Config, Entry->Path) && IsSelected(Selection, SelectionCount, Entry->Path))
+                {
+                    if (!Shown)
+                    {
+                        printf("%s\n", HistoryTime(Began[Index]).Text);
+                        Shown = true;
+                    }
+                    printf("    %c %9s  %.8s  %s\n", Kind, SizeText(Entry->Size).Text, Entry->Hash, Entry->Path);
+                }
+            }
+        }
+        // --- the oldest version kept: what the selected paths were before the first push in the history ---
+        u32 OldestCount = 0;
+        for (u32 EntryIndex = 0; EntryIndex < Versions[0].Count; ++EntryIndex)
+        {
+            file_entry *Entry = Versions[0].Entries + EntryIndex;
+            if (InScope(Config, Entry->Path) && IsSelected(Selection, SelectionCount, Entry->Path))
+            {
+                if (SelectionCount && !OldestCount)
+                {
+                    printf("%s\n", VersionCount > 1 ? "before that" : "now (no earlier versions kept)");
+                }
+                if (SelectionCount)
+                {
+                    printf("    = %9s  %.8s  %s\n", SizeText(Entry->Size).Text, Entry->Hash, Entry->Path);
+                }
+                ++OldestCount;
+            }
+        }
+        if (!SelectionCount)
+        {
+            printf("%s: %u file%s\n", VersionCount > 1 ? "before that" : "now (no earlier versions kept)",
+                   OldestCount, Plural(OldestCount));
+        }
+        printf("restore a version with: assets restore PATH VERSION (the 8 characters before the path)\n");
+        return 0;
+    }
+
     // SECTION: this checkout: base.txt (its last sync, within the folders) and what's in the folders now
     manifest Base = {};
     {
@@ -1895,7 +2204,93 @@ main(void)
             {
                 Change->Kind = Change_Conflict;
             }
+            if (!IsSelected(Selection, SelectionCount, Path))
+            {
+                Change->Kind = Change_None;
+                Change->KeepBase = true;
+            }
         }
+    }
+
+    // SECTION: restore: one file's version from the history, fetched like a pull; base.txt keeps its entry
+    //          (so the file shows as changed here, and push sends it)
+    if (Restore)
+    {
+        char *Path = Selection[0];
+        char Version[65] = {};
+        snprintf(Version, sizeof(Version), "%s", Extras[1]);
+        size_t VersionLength = strlen(Version);
+        bool32 Hex = VersionLength >= 4;
+        for (char *C = Version; *C; ++C)
+        {
+            *C = (char)tolower((u8)*C);
+            Hex = Hex && isxdigit((u8)*C);
+        }
+        if (!Hex)
+        {
+            fprintf(stderr, "%s: a version is 4 to 64 hex digits, from assets log\n", Extras[1]);
+            return 1;
+        }
+        file_entry *Target = 0;
+        char *TargetBegan = 0;
+        bool32 Ambiguous = false;
+        for (u32 Index = VersionCount; Index-- > 0;)
+        {
+            for (u32 EntryIndex = 0; EntryIndex < Versions[Index].Count; ++EntryIndex)
+            {
+                file_entry *Entry = Versions[Index].Entries + EntryIndex;
+                if (!_stricmp(Entry->Path, Path) && !strncmp(Entry->Hash, Version, VersionLength))
+                {
+                    Ambiguous = Ambiguous || (Target && strcmp(Target->Hash, Entry->Hash) != 0);
+                    if (!Target)
+                    {
+                        Target = Entry;
+                        TargetBegan = Began[Index];
+                    }
+                }
+            }
+        }
+        if (!Target || Ambiguous)
+        {
+            fprintf(stderr, "%s: %s version %s in the last %d days (assets log %s)\n", Path,
+                    Ambiguous ? "more than one" : "no", Version, TRASH_DAYS, Extras[0]);
+            return 1;
+        }
+        change *Change = 0;
+        for (u32 ChangeIndex = 0; !Change && ChangeIndex < ChangeCount; ++ChangeIndex)
+        {
+            Change = !_stricmp(Changes[ChangeIndex].Path, Target->Path) ? Changes + ChangeIndex : 0;
+        }
+        if (!Change)
+        {
+            Change = Changes + ChangeCount++;
+            Change->Path = Target->Path;
+        }
+        if (Change->Here && !strcmp(Change->Here->Hash, Target->Hash))
+        {
+            printf("%s is already version %.8s\n", Change->Path, Target->Hash);
+            return 0;
+        }
+        // NOTE: This checkout's copy is replaced, so it must be a version the remote keeps.
+        bool32 Kept = !Change->Here;
+        for (u32 Index = 0; !Kept && Index < VersionCount; ++Index)
+        {
+            for (u32 EntryIndex = 0; !Kept && EntryIndex < Versions[Index].Count; ++EntryIndex)
+            {
+                Kept = !strcmp(Versions[Index].Entries[EntryIndex].Hash, Change->Here->Hash);
+            }
+        }
+        if (!Kept)
+        {
+            fprintf(stderr, "%s: its changes here aren't on the remote; push it (or move it away) first\n", Change->Path);
+            return 1;
+        }
+        Change->Kind = Change_Pull;
+        Change->Server = Target;
+        Change->KeepBase = true;
+        printf("restore   %c %9s  %.8s  %s (%s%s)\n", Change->Here ? 'M' : 'A', SizeText(Target->Size).Text,
+               Target->Hash, Change->Path, TargetBegan ? "pushed " : "from before the history",
+               TargetBegan ? HistoryTime(TargetBegan).Text : "");
     }
 
     // SECTION: print the changes (status stops here)
@@ -1908,7 +2303,7 @@ main(void)
     u32 UpCount = 0;
     u64 UpBytes = 0;
     u32 DeleteThereCount = 0;
-    for (u32 ChangeIndex = 0; ChangeIndex < ChangeCount; ++ChangeIndex)
+    for (u32 ChangeIndex = 0; ChangeIndex < ChangeCount && !Restore; ++ChangeIndex)
     {
         change *Change = Changes + ChangeIndex;
         file_entry *Shown = Change->Here ? Change->Here : Change->Server;
@@ -1917,7 +2312,7 @@ main(void)
             case Change_None:
             {
                 // NOTE: A path only in base.txt (deleted here and on the remote) isn't a file anywhere.
-                if (Change->Here)
+                if (Change->Here && !Change->KeepBase)
                 {
                     ++InSyncCount;
                     InSyncBytes += Change->Here->Size;
@@ -1980,13 +2375,19 @@ main(void)
     }
     if (DownCount || DeleteHereCount)
     {
-        printf("to pull: %u files, %s; %u deleted here\n", DownCount, SizeText(DownBytes).Text, DeleteHereCount);
+        printf("to pull: %u file%s, %s; %u deleted here\n", DownCount, Plural(DownCount), SizeText(DownBytes).Text,
+               DeleteHereCount);
     }
     if (UpCount || DeleteThereCount)
     {
-        printf("to push: %u files, %s; %u deleted on the remote\n", UpCount, SizeText(UpBytes).Text, DeleteThereCount);
+        printf("to push: %u file%s, %s; %u deleted on the remote\n", UpCount, Plural(UpCount), SizeText(UpBytes).Text,
+               DeleteThereCount);
     }
-    printf("%u files the same here and on the remote (%s)\n", InSyncCount, SizeText(InSyncBytes).Text);
+    if (!Restore)
+    {
+        printf("%u file%s the same here and on the remote (%s)\n", InSyncCount, Plural(InSyncCount),
+               SizeText(InSyncBytes).Text);
+    }
     if (ScanFailed)
     {
         // NOTE: A file that couldn't be read looks deleted, which a push would send to the remote.
@@ -1996,7 +2397,7 @@ main(void)
 
     // SECTION: pull: deletes first (a case-only rename on the remote is a delete and an add of the same file here)
     bool32 PullFailed = false;
-    if (Pull || Push)
+    if (Pull || Push || Restore)
     {
         // NOTE: A deleted file moves into .assets/tmp until the pull ends: a file the remote renamed is
         //       rebuilt from it instead of fetched.
@@ -2390,8 +2791,8 @@ main(void)
         }
         if (DownloadCount)
         {
-            printf("pulled: %u chunks fetched (%s), %u reused from this checkout\n", FetchedCount,
-                   SizeText(FetchedBytes).Text, ReusedCount);
+            printf("%s: %u chunk%s fetched (%s), %u reused from this checkout\n", Restore ? "restored" : "pulled",
+                   FetchedCount, Plural(FetchedCount), SizeText(FetchedBytes).Text, ReusedCount);
         }
 
         // --- base.txt becomes the remote's manifest (within the folders), except where pull failed ---
@@ -2402,11 +2803,11 @@ main(void)
         {
             change *Change = Changes + ChangeIndex;
             PullFailed = PullFailed || Change->Failed;
-            if (Change->Failed && Change->Base)
+            if ((Change->Failed || Change->KeepBase) && Change->Base)
             {
                 AddEntry(&NewBase, *Change->Base);
             }
-            else if (!Change->Failed && Change->Server)
+            else if (!Change->Failed && !Change->KeepBase && Change->Server)
             {
                 file_entry Entry = *Change->Server;
                 file_entry *Current = FindEntry(&Here, Change->Path);
@@ -2429,11 +2830,14 @@ main(void)
     bool32 PushFailed = false;
     if (Push && !PullFailed)
     {
-        bool32 UpToDate = (Here.Count == Server.Count);
-        for (u32 EntryIndex = 0; UpToDate && EntryIndex < Here.Count; ++EntryIndex)
+        // NOTE: Pushed is the remote's part within the folders after this push: this checkout's files at the
+        //       paths given (all, without paths), the remote's as they are everywhere else.
+        manifest Pushed = TakeSelected(&Here, &Server, Selection, SelectionCount);
+        bool32 UpToDate = (Pushed.Count == Server.Count);
+        for (u32 EntryIndex = 0; UpToDate && EntryIndex < Pushed.Count; ++EntryIndex)
         {
-            UpToDate = !strcmp(Here.Entries[EntryIndex].Path, Server.Entries[EntryIndex].Path) &&
-                       !strcmp(Here.Entries[EntryIndex].Hash, Server.Entries[EntryIndex].Hash);
+            UpToDate = !strcmp(Pushed.Entries[EntryIndex].Path, Server.Entries[EntryIndex].Path) &&
+                       !strcmp(Pushed.Entries[EntryIndex].Hash, Server.Entries[EntryIndex].Hash);
         }
         if (UpToDate)
         {
@@ -2441,11 +2845,11 @@ main(void)
         }
         else
         {
-            // --- the new manifest: this checkout's files, plus the remote's entries outside its folders ---
+            // --- the new manifest: Pushed, plus the remote's entries outside this checkout's folders ---
             manifest Next = {};
-            for (u32 EntryIndex = 0; EntryIndex < Here.Count; ++EntryIndex)
+            for (u32 EntryIndex = 0; EntryIndex < Pushed.Count; ++EntryIndex)
             {
-                AddEntry(&Next, Here.Entries[EntryIndex]);
+                AddEntry(&Next, Pushed.Entries[EntryIndex]);
             }
             for (u32 EntryIndex = 0; EntryIndex < ServerOut.Count; ++EntryIndex)
             {
@@ -2465,12 +2869,12 @@ main(void)
             }
             ServerHashCount = SortUnique(ServerHashes, ServerHashCount);
             u32 UploadCount = 0;
-            file_entry **Uploads = (file_entry **)malloc((Here.Count + 1)*sizeof(file_entry *));
-            u32 *UploadFirst = (u32 *)calloc(Here.Count + 1, sizeof(u32));
+            file_entry **Uploads = (file_entry **)malloc((Pushed.Count + 1)*sizeof(file_entry *));
+            u32 *UploadFirst = (u32 *)calloc(Pushed.Count + 1, sizeof(u32));
             chunk_list UploadChunks = {};
-            for (u32 EntryIndex = 0; EntryIndex < Here.Count && !PushFailed; ++EntryIndex)
+            for (u32 EntryIndex = 0; EntryIndex < Pushed.Count && !PushFailed; ++EntryIndex)
             {
-                file_entry *Entry = Here.Entries + EntryIndex;
+                file_entry *Entry = Pushed.Entries + EntryIndex;
                 bool32 OnServer = Contains(ServerHashes, ServerHashCount, Entry->Hash);
                 for (u32 UploadIndex = 0; !OnServer && UploadIndex < UploadCount; ++UploadIndex)
                 {
@@ -2500,7 +2904,7 @@ main(void)
             u32 DeletedCount = 0;
             for (u32 EntryIndex = 0; EntryIndex < Server.Count; ++EntryIndex)
             {
-                DeletedCount += FindEntry(&Here, Server.Entries[EntryIndex].Path) ? 0 : 1;
+                DeletedCount += FindEntry(&Pushed, Server.Entries[EntryIndex].Path) ? 0 : 1;
             }
 
             // --- which chunks the remote lacks ---
@@ -2918,12 +3322,15 @@ main(void)
 
             if (!PushFailed)
             {
+                // NOTE: The base takes this checkout's files at the paths given; elsewhere it stays as pull left it.
+                manifest PushedBase = TakeSelected(&Here, &Base, Selection, SelectionCount);
                 u32 BaseSize = 0;
-                char *BaseText = FormatManifest(&Here, true, &BaseSize);
+                char *BaseText = FormatManifest(&PushedBase, true, &BaseSize);
                 PushFailed = !WriteWholeFile(BasePath, BaseText, BaseSize);
                 free(BaseText);
-                printf("pushed: %u files changed, %u chunks sent (%s), %u files deleted (kept on the remote for %d days)\n",
-                       UploadCount, SentChunks, SizeText(SentBytes).Text, DeletedCount, TRASH_DAYS);
+                printf("pushed: %u file%s changed, %u chunk%s sent (%s), %u file%s deleted (kept on the remote for %d days)\n",
+                       UploadCount, Plural(UploadCount), SentChunks, Plural(SentChunks), SizeText(SentBytes).Text,
+                       DeletedCount, Plural(DeletedCount), TRASH_DAYS);
             }
             free(Missing);
             free(Unique.Chunks);
@@ -2948,5 +3355,6 @@ main(void)
         }
     }
 
-    return (PullFailed || PushFailed) ? 1 : 0;
+    // NOTE: status exits with 2 when the remote has changes to pull, for scripts (a build warning of stale art).
+    return (PullFailed || PushFailed) ? 1 : (Status && (DownCount || DeleteHereCount)) ? 2 : 0;
 }

@@ -27,18 +27,18 @@ fi
 Failed=0
 Log="$Work/last.txt"
 
-# run CHECKOUT VERB: assets from CHECKOUT's art folder (it finds assets.txt above); the output goes to $Log
-run() { (cd "$Work/$1/art" 2>/dev/null || cd "$Work/$1"; timeout 300 "$Exe" "$2") > "$Log" 2>&1 < /dev/null; }
-A() { run A "$1"; }
-B() { run B "$1"; }
+# run CHECKOUT VERB [ARGS...]: assets from CHECKOUT's art folder (it finds assets.txt above); the output goes to $Log
+run() { RunIn=$1; shift; (cd "$Work/$RunIn/art" 2>/dev/null || cd "$Work/$RunIn"; timeout 300 "$Exe" "$@") > "$Log" 2>&1 < /dev/null; }
+A() { run A "$@"; }
+B() { run B "$@"; }
 check() {
     if eval "$2"; then echo "ok      $1"; else echo "FAILED  $1"; sed 's/^/        /' "$Log"; Failed=$((Failed + 1)); fi
 }
 # the synced files of a checkout, with their hashes
 tree() { (cd "$Work/$1" && find art db -type f ! -name "*.lock" 2>/dev/null | LC_ALL=C sort | while read -r f; do echo "$(sha256sum < "$f" | cut -c1-64) $f"; done); }
-# "pushed: F files changed, C chunks sent (K KB)" / "pulled: C chunks fetched (K KB), R reused"
-sent() { sed -n 's/^pushed: .* \([0-9]*\) chunks sent.*/\1/p' "$Log"; }
-fetched() { sed -n 's/^pulled: \([0-9]*\) chunks fetched.*/\1/p' "$Log"; }
+# "pushed: F files changed, C chunks sent (S)" / "pulled: C chunks fetched (S), R reused" (1 chunk, 1 file)
+sent() { sed -n 's/^pushed: .* \([0-9]*\) chunks\? sent.*/\1/p' "$Log"; }
+fetched() { sed -n 's/^pulled: \([0-9]*\) chunks\? fetched.*/\1/p' "$Log"; }
 reused() { sed -n 's/^pulled: .*, \([0-9]*\) reused.*/\1/p' "$Log"; }
 for C in A B; do
     mkdir -p "$Work/$C"
@@ -193,6 +193,52 @@ check "another remote: push fills it, nothing here changes" 'A push && [ "$(tree
 printf 'remote %s\nfolder art\nfolder db\nignore *.lock\n' "$Remote" > "$Work/A/assets.txt"
 check "back to the first remote: in sync" 'A status && ! grep -qE "^(pull|push|conflict|restored|kept)" "$Log" && [ "$(tree A)" = "$Before" ]'
 
+# --- status exits with 2 when the remote has changes to pull (a build's stale-art check) ---
+printf exit2 > "$Work/B/art/exit2.png"
+B push > /dev/null
+check "status: 2 when the remote has changes to pull" 'A status; [ $? = 2 ] && grep -q "^pull      A .*art/exit2.png" "$Log"'
+A pull > /dev/null
+check "status: 0 when in sync" 'A status'
+printf local > "$Work/A/art/local.png"
+check "status: 0 with only changes to push" 'A status && grep -q "^push      A .*art/local.png" "$Log"'
+check "help" '"$Exe" help > "$Log" && grep -q "restore PATH VERSION" "$Log"'
+
+# --- paths (from the current folder) limit a command to them; the rest stays as it is ---
+mkdir -p "$Work/A/art/pack1" "$Work/A/art/pack2"
+printf p1 > "$Work/A/art/pack1/x.png"
+printf p2 > "$Work/A/art/pack2/y.png"
+check "paths: status shows only them" 'A status pack1 && grep -q "art/pack1/x.png" "$Log" && ! grep -qE "pack2|local.png" "$Log"'
+check "paths: push sends only them" 'A push pack1 && server "grep -q art/pack1/x.png manifest.txt" && ! server "grep -qE \"art/pack2|local.png\" manifest.txt"'
+check "paths: the rest is still to push" 'A status && grep -q "^push      A .*art/pack2/y.png" "$Log" && ! grep -q "pack1" "$Log"'
+A push pack2 > /dev/null
+check "paths: pull takes only them" 'B pull pack1 && [ -e "$Work/B/art/pack1/x.png" ] && [ ! -e "$Work/B/art/pack2/y.png" ]'
+check "paths: the rest is still to pull" 'B status; [ $? = 2 ] && grep -q "art/pack2/y.png" "$Log" && ! grep -q "pack1" "$Log"'
+check "paths: outside the folders refused" '! A status ../notsynced.txt && grep -q "not in a synced folder" "$Log"'
+check "paths: outside the repository refused" '! A status ../.. && grep -q "outside this repository" "$Log"'
+A push > /dev/null
+B pull > /dev/null
+
+# --- log lists every push in the history; restore puts a version back as a change here ---
+printf v1 > "$Work/A/art/hist.png"
+A push > /dev/null
+printf v2 > "$Work/A/art/hist.png"
+A push > /dev/null
+V1=$(printf v1 | sha256sum | cut -c1-8)
+V2=$(printf v2 | sha256sum | cut -c1-8)
+check "log: each version of a file" 'A log hist.png && grep -q "M .* $V2  art/hist.png" "$Log" && grep -q "A .* $V1  art/hist.png" "$Log"'
+check "log: every push" 'A log && grep -q "art/local.png" "$Log" && grep -q "art/pack2/y.png" "$Log"'
+printf v3 > "$Work/A/art/hist.png"
+check "restore: refuses changes the remote doesn't have" '! A restore hist.png $V1 && grep -q "aren.t on the remote" "$Log" && [ "$(cat "$Work/A/art/hist.png")" = v3 ]'
+printf v2 > "$Work/A/art/hist.png"
+check "restore: the version comes back as a change here" 'A restore hist.png $V1 && [ "$(cat "$Work/A/art/hist.png")" = v1 ] && A status && grep -q "^push      M .*art/hist.png" "$Log"'
+check "restore: push sends it on" 'A push && B pull && [ "$(cat "$Work/B/art/hist.png")" = v1 ]'
+rm "$Work/A/art/hist.png"
+A push > /dev/null
+check "restore: a deleted file" 'A restore hist.png $V2 && [ "$(cat "$Work/A/art/hist.png")" = v2 ]'
+check "restore: an unknown version refused" '! A restore hist.png 0000dead && grep -q "no version" "$Log"'
+A push > /dev/null
+B pull > /dev/null
+
 # --- a store path that would leave the repository is refused before anything is written ---
 server "cp manifest.txt manifest.keep && echo \"\$(head -c 64 manifest.txt) 1 art/../escaped.txt\" >> manifest.txt"
 check "unsafe store path: refused" '! B pull && grep -q "unsafe" "$Log" && [ ! -e "$Work/B/escaped.txt" ] && [ ! -e "$Work/escaped.txt" ]'
@@ -217,7 +263,7 @@ mkdir -p "$G/art"
 git init -q "$G"
 printf 'remote %s\nfolder art\n' "$Remote" > "$G/assets.txt"
 printf one > "$G/art/a.png"
-check "git: status warns about an unignored folder" '(cd "$G" && "$Exe" status) > "$Log" 2>&1 < /dev/null && grep -q "aren.t ignored by git" "$Log" && grep -q "remote copy" "$Log"'
+check "git: status warns about an unignored folder" '(cd "$G" && "$Exe" status) > "$Log" 2>&1 < /dev/null; [ $? != 1 ] && grep -q "aren.t ignored by git" "$Log" && grep -q "remote copy" "$Log"'
 check "git: no console answers no" '! (cd "$G" && "$Exe" push) > "$Log" 2>&1 < /dev/null && grep -q "no answer" "$Log"'
 check "git: n stops" '! (cd "$G" && echo n | "$Exe" push) > "$Log" 2>&1 && grep -q "stopped" "$Log"'
 check "git: a adds the folder to .gitignore and pushes" '(cd "$G" && echo a | "$Exe" push) > "$Log" 2>&1 && grep -qx "/art/" "$G/.gitignore" && grep -q "^pushed" "$Log"'
