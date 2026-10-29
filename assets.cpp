@@ -150,6 +150,35 @@ struct change
 #define VERSION "0.1.0"
 #define STORE_FORMAT "assets 1"
 
+struct size_text
+{
+    char Text[16];
+};
+
+// NOTE: "812 B", "4.0 KB", "155.3 MB", "3.82 GB" (powers of 1024).
+internal size_text
+SizeText(u64 Bytes)
+{
+    size_text Result = {};
+    if (Bytes < 1024)
+    {
+        snprintf(Result.Text, sizeof(Result.Text), "%llu B", Bytes);
+    }
+    else if (Bytes < (1ull << 20))
+    {
+        snprintf(Result.Text, sizeof(Result.Text), "%.1f KB", (double)Bytes / (1ull << 10));
+    }
+    else if (Bytes < (1ull << 30))
+    {
+        snprintf(Result.Text, sizeof(Result.Text), "%.1f MB", (double)Bytes / (1ull << 20));
+    }
+    else
+    {
+        snprintf(Result.Text, sizeof(Result.Text), "%.2f GB", (double)Bytes / (1ull << 30));
+    }
+    return Result;
+}
+
 internal int
 CompareEntries(const void *A, const void *B)
 {
@@ -1045,12 +1074,30 @@ main(void)
     }
     if (!Status && !Pull && !Push && !Verify)
     {
-        fprintf(stderr, "usage: assets status|pull|push|verify|version\n"
-                        "  in a folder at or under one with an assets.txt file, of lines:\n"
-                        "    remote origin | HOST:DIR | C:\\folder | \\\\server\\share\\folder\n"
-                        "    folder art              (one line per folder, inside the repository)\n"
-                        "    ignore *.lock           (names to leave out; * and ? are wildcards)\n");
-        return 1;
+        bool32 Help = !strcmp(Verb, "help") || !strcmp(Verb, "--help") || !strcmp(Verb, "-h") || !strcmp(Verb, "/?");
+        fprintf(Help ? stdout : stderr,
+                "usage: assets COMMAND\n"
+                "\n"
+                "  status    list what differs between this checkout and the remote; changes nothing\n"
+                "  pull      bring the remote's changes here\n"
+                "  push      pull, then send this checkout's changes (only chunks the remote lacks)\n"
+                "  verify    check every chunk and file on the remote against its hash\n"
+                "  version   print the version and the store format\n"
+                "  help      print this\n"
+                "\n"
+                "Run in the folder with assets.txt or any folder below it. assets.txt, one setting per line:\n"
+                "  remote origin         git's origin remote, plus /assets\n"
+                "  remote HOST:DIR       a folder on an ssh server\n"
+                "  remote D:\\store       a local folder, mapped drive or \\\\server\\share\\folder\n"
+                "  folder art            a folder to sync, inside the repository (one line each)\n"
+                "  ignore *.lock         names to leave out; * and ? are wildcards\n"
+                "  # text                a comment\n"
+                "\n"
+                "A file changed here and on the remote is kept twice: pull renames yours to\n"
+                "NAME.conflict-CHECKOUT-TIME.EXT. Keep one, delete the other, push.\n"
+                "Replaced and deleted files stay on the remote for %d days.\n",
+                TRASH_DAYS);
+        return Help ? 0 : 1;
     }
 
     // SECTION: find the repository: the nearest folder with an assets.txt, at or above the current one
@@ -1852,21 +1899,94 @@ main(void)
     }
 
     // SECTION: print the changes (status stops here)
+    // NOTE: Sizes are whole files; a transfer sends only the chunks the other side lacks.
     u32 InSyncCount = 0;
+    u64 InSyncBytes = 0;
+    u32 DownCount = 0;
+    u64 DownBytes = 0;
+    u32 DeleteHereCount = 0;
+    u32 UpCount = 0;
+    u64 UpBytes = 0;
+    u32 DeleteThereCount = 0;
     for (u32 ChangeIndex = 0; ChangeIndex < ChangeCount; ++ChangeIndex)
     {
         change *Change = Changes + ChangeIndex;
+        file_entry *Shown = Change->Here ? Change->Here : Change->Server;
         switch (Change->Kind)
         {
-            case Change_None: ++InSyncCount; break;
-            case Change_Pull: printf("pull      %c %s\n", !Change->Here ? 'A' : !Change->Server ? 'D' : 'M', Change->Path); break;
-            case Change_Push: printf("push      %c %s\n", !Change->Server ? 'A' : !Change->Here ? 'D' : 'M', Change->Path); break;
-            case Change_KeptHere: printf("kept        %s (deleted on the remote, changed here: push adds it back)\n", Change->Path); break;
-            case Change_Restored: printf("restored    %s (deleted here, changed on the remote: pull brings it back)\n", Change->Path); break;
-            case Change_Conflict: printf("conflict    %s (changed here and on the remote: pull keeps both)\n", Change->Path); break;
+            case Change_None:
+            {
+                // NOTE: A path only in base.txt (deleted here and on the remote) isn't a file anywhere.
+                if (Change->Here)
+                {
+                    ++InSyncCount;
+                    InSyncBytes += Change->Here->Size;
+                }
+            } break;
+            case Change_Pull:
+            {
+                Shown = Change->Server ? Change->Server : Change->Here;
+                printf("pull      %c %9s  %s\n", !Change->Here ? 'A' : !Change->Server ? 'D' : 'M', SizeText(Shown->Size).Text,
+                       Change->Path);
+                if (Change->Server)
+                {
+                    ++DownCount;
+                    DownBytes += Change->Server->Size;
+                }
+                else
+                {
+                    ++DeleteHereCount;
+                }
+            } break;
+            case Change_Push:
+            {
+                printf("push      %c %9s  %s\n", !Change->Server ? 'A' : !Change->Here ? 'D' : 'M', SizeText(Shown->Size).Text,
+                       Change->Path);
+                if (Change->Here)
+                {
+                    ++UpCount;
+                    UpBytes += Change->Here->Size;
+                }
+                else
+                {
+                    ++DeleteThereCount;
+                }
+            } break;
+            case Change_KeptHere:
+            {
+                printf("kept        %9s  %s (deleted on the remote, changed here: push adds it back)\n",
+                       SizeText(Change->Here->Size).Text, Change->Path);
+                ++UpCount;
+                UpBytes += Change->Here->Size;
+            } break;
+            case Change_Restored:
+            {
+                printf("restored    %9s  %s (deleted here, changed on the remote: pull brings it back)\n",
+                       SizeText(Change->Server->Size).Text, Change->Path);
+                ++DownCount;
+                DownBytes += Change->Server->Size;
+            } break;
+            case Change_Conflict:
+            {
+                // NOTE: Pull brings the remote's version; push then sends this checkout's, as the conflict copy.
+                printf("conflict    %9s  %s (changed here and on the remote: pull keeps both)\n",
+                       SizeText(Change->Server->Size).Text, Change->Path);
+                ++DownCount;
+                DownBytes += Change->Server->Size;
+                ++UpCount;
+                UpBytes += Change->Here->Size;
+            } break;
         }
     }
-    printf("%u files the same here and on the remote\n", InSyncCount);
+    if (DownCount || DeleteHereCount)
+    {
+        printf("to pull: %u files, %s; %u deleted here\n", DownCount, SizeText(DownBytes).Text, DeleteHereCount);
+    }
+    if (UpCount || DeleteThereCount)
+    {
+        printf("to push: %u files, %s; %u deleted on the remote\n", UpCount, SizeText(UpBytes).Text, DeleteThereCount);
+    }
+    printf("%u files the same here and on the remote (%s)\n", InSyncCount, SizeText(InSyncBytes).Text);
     if (ScanFailed)
     {
         // NOTE: A file that couldn't be read looks deleted, which a push would send to the remote.
@@ -2270,8 +2390,8 @@ main(void)
         }
         if (DownloadCount)
         {
-            printf("pulled: %u chunks fetched (%llu KB), %u reused from this checkout\n", FetchedCount,
-                   (FetchedBytes + 1023) >> 10, ReusedCount);
+            printf("pulled: %u chunks fetched (%s), %u reused from this checkout\n", FetchedCount,
+                   SizeText(FetchedBytes).Text, ReusedCount);
         }
 
         // --- base.txt becomes the remote's manifest (within the folders), except where pull failed ---
@@ -2802,8 +2922,8 @@ main(void)
                 char *BaseText = FormatManifest(&Here, true, &BaseSize);
                 PushFailed = !WriteWholeFile(BasePath, BaseText, BaseSize);
                 free(BaseText);
-                printf("pushed: %u files changed, %u chunks sent (%llu KB), %u files deleted (kept on the remote for %d days)\n",
-                       UploadCount, SentChunks, (SentBytes + 1023) >> 10, DeletedCount, TRASH_DAYS);
+                printf("pushed: %u files changed, %u chunks sent (%s), %u files deleted (kept on the remote for %d days)\n",
+                       UploadCount, SentChunks, SizeText(SentBytes).Text, DeletedCount, TRASH_DAYS);
             }
             free(Missing);
             free(Unique.Chunks);
